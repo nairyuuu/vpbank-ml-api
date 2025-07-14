@@ -1,0 +1,42 @@
+{
+  "name": "vpbank-ml-api",
+  "version": "1.0.0",
+  "description": "VPBank ML API for fraud detection using ONNX models",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "docker:build": "docker build -t vpbank-ml-api .",
+    "docker:run": "docker run -p 3000:3000 vpbank-ml-api"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "kafkajs": "^2.2.4",
+    "onnxruntime-node": "^1.16.3",
+    "aws-sdk": "^2.1490.0",
+    "axios": "^1.6.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "winston": "^3.11.0",
+    "joi": "^17.11.0",
+    "lodash": "^4.17.21",
+    "uuid": "^9.0.1",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "fraud-detection",
+    "ml",
+    "onnx",
+    "kafka",
+    "expressjs",
+    "vpbank"
+  ],
+  "author": "VPBank Hackathon Team",
+  "license": "MIT"
+}
