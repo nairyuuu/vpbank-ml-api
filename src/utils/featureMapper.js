@@ -3,8 +3,6 @@
  * Maps from the Kafka topic structure to the training CSV format
  */
 
-const _ = require('lodash');
-
 class FeatureMapper {
   /**
    * Maps Kafka enriched features to model input format
@@ -83,10 +81,45 @@ class FeatureMapper {
       ),
       same_device_txn_1h: aggregation.device_txn_count_1h,
       
+      // New features for QR model
+      lat_shift: this.calculateLatShift(location.billing_lat, 38.9), // Assume center lat
+      lng_shift: this.calculateLngShift(location.billing_long, -91.2), // Assume center lng
+      change_in_user_agent: behavioral.is_new_device ? 1 : 0,
+      
       // Suspicious indicators
-      suspicious_agent: this.isSuspiciousUserAgent(behavioral.user_agent),
-      change_in_user_agent: behavioral.is_new_device ? 1 : 0
+      suspicious_agent: this.isSuspiciousUserAgent(behavioral.user_agent || behavioral.device_fingerprint)
     };
+
+    // Set default values for missing fields
+    features.user_agent = behavioral.user_agent || behavioral.device_fingerprint || '';
+    features.device_fingerprint = behavioral.device_fingerprint || '';
+    features.email_domain = behavioral.email_domain || features.email_domain || '';
+    
+    // Ensure all aggregation fields have defaults
+    features.user_txn_count_1h = features.user_txn_count_1h || 0;
+    features.user_amount_sum_1h = features.user_amount_sum_1h || 0;
+    features.user_amount_avg_1h = features.user_amount_avg_1h || 0;
+    features.user_unique_merchants_1h = aggregation.user_unique_merchants_1h || 0;
+    features.user_txn_count_24h = features.user_txn_count_24h || 0;
+    features.user_amount_sum_24h = features.user_amount_sum_24h || 0;
+    features.user_amount_avg_24h = features.user_amount_avg_24h || 0;
+    features.user_unique_merchants_24h = aggregation.user_unique_merchants_24h || 0;
+    features.user_unique_channels_24h = aggregation.user_unique_channels_24h || 0;
+    features.merchant_txn_count_1h = aggregation.merchant_txn_count_1h || 0;
+    features.merchant_amount_sum_1h = aggregation.merchant_amount_sum_1h || 0;
+    features.merchant_unique_users_1h = aggregation.merchant_unique_users_1h || 0;
+    features.device_txn_count_1h = aggregation.device_txn_count_1h || 0;
+    features.ip_txn_count_1h = aggregation.ip_txn_count_1h || 0;
+    features.seconds_since_last_txn = aggregation.seconds_since_last_txn || 0;
+    features.is_velocity_anomaly = aggregation.is_velocity_anomaly ? 1 : 0;
+    features.is_amount_anomaly = aggregation.is_amount_anomaly ? 1 : 0;
+    features.is_new_merchant = aggregation.is_new_merchant ? 1 : 0;
+    features.is_new_location = aggregation.is_new_location ? 1 : 0;
+    features.is_rapid_fire = aggregation.is_rapid_fire ? 1 : 0;
+
+    // Calculate derived features
+    features.amount_x_velocity = features.amount_log * features.velocity_1h;
+    features.geo_rank_ratio = features.geo_distance_from_last_txn / Math.max(features.rank_amount_per_day, 1);
 
     return features;
   }
@@ -181,6 +214,26 @@ class FeatureMapper {
   }
 
   /**
+   * Calculates latitude shift from reference point
+   * @param {number} lat - Current latitude
+   * @param {number} refLat - Reference latitude
+   * @returns {number} - Latitude shift
+   */
+  static calculateLatShift(lat, refLat) {
+    return Math.abs(lat - refLat);
+  }
+
+  /**
+   * Calculates longitude shift from reference point
+   * @param {number} lng - Current longitude
+   * @param {number} refLng - Reference longitude
+   * @returns {number} - Longitude shift
+   */
+  static calculateLngShift(lng, refLng) {
+    return Math.abs(lng - refLng);
+  }
+
+  /**
    * Checks if user agent is suspicious
    * @param {string} userAgent - User agent string
    * @returns {number} - 1 if suspicious, 0 otherwise
@@ -200,31 +253,90 @@ class FeatureMapper {
   }
 
   /**
+   * Calculates latitude shift from center
+   * @param {number} lat - Current latitude
+   * @param {number} centerLat - Center latitude
+   * @returns {number} - Latitude shift
+   */
+  static calculateLatShift(lat, centerLat) {
+    return Math.abs(lat - centerLat);
+  }
+
+  /**
+   * Calculates longitude shift from center
+   * @param {number} lng - Current longitude
+   * @param {number} centerLng - Center longitude
+   * @returns {number} - Longitude shift
+   */
+  static calculateLngShift(lng, centerLng) {
+    return Math.abs(lng - centerLng);
+  }
+
+  /**
    * Prepares features array for ONNX model input
    * @param {Object} features - Feature object
    * @param {string} modelType - Model type (qr, ibft, topup)
-   * @returns {Float32Array} - Features array for ONNX
+   * @param {string} stage - Model stage ('xgb' for QR, ignored for others)
+   * @returns {Float32Array|BigInt64Array} - Features array for ONNX
    */
-  static prepareONNXInput(features, modelType) {
-    // Define feature order based on training CSV header
-    const featureOrder = [
-      'is_weekend', 'is_night', 'txn_type_idx', 'is_ibft', 'is_topup', 'is_qr',
-      'amount_usd', 'amount_log', 'is_high_amount', 'name_is_ascii', 'name_has_digit',
-      'name_has_symbol', 'name_repeated_char', 'disposable_email_flag', 'billing_lat',
-      'billing_long', 'seconds_since_last_txn', 'is_new_device', 'geo_distance_from_last_txn',
-      'suspicious_agent', 'is_business_hours', 'sum_amount_1h', 'avg_amount_1h',
-      'txn_count_1h', 'sum_amount_24h', 'avg_amount_24h', 'txn_count_24h',
-      'velocity_1h', 'rank_amount_per_day', 'change_in_user_agent',
-      'geo_speed_km_per_min', 'same_device_txn_1h'
-    ];
+  static prepareONNXInput(features, modelType, stage = 'xgb') {
+    let featureOrder = [];
+    let dataType = 'float32';
 
-    // Create feature array in correct order
+    if (modelType === 'qr') {
+      // QR XGBoost model requires int64 input with 34 features
+      dataType = 'int64';
+      featureOrder = [
+        'is_weekend', 'is_night', 'txn_type_idx', 'is_ibft', 'is_topup', 'is_qr',
+        'amount_usd', 'amount_log', 'is_high_amount',
+        'name_is_ascii', 'name_has_digit', 'name_has_symbol', 'name_repeated_char',
+        'disposable_email_flag', 'billing_lat', 'billing_long',
+        'seconds_since_last_txn', 'is_new_device', 'geo_distance_from_last_txn',
+        'suspicious_agent', 'is_business_hours', 'sum_amount_1h', 'avg_amount_1h',
+        'txn_count_1h', 'sum_amount_24h', 'avg_amount_24h', 'txn_count_24h',
+        'velocity_1h', 'rank_amount_per_day', 'change_in_user_agent',
+        'lat_shift', 'lng_shift', 'geo_speed_km_per_min', 'same_device_txn_1h'
+      ];
+    } else if (modelType === 'ibft') {
+      // IBFT model requires float32 input with 27 features (same as TopUp but without last feature)
+      dataType = 'float32';
+      featureOrder = [
+        'is_weekend', 'is_night', 'txn_type_idx', 'is_ibft', 'is_topup', 'is_qr',
+        'amount_usd', 'amount_log', 'is_high_amount', 
+        'name_is_ascii', 'name_has_digit', 'name_has_symbol', 'name_repeated_char', 
+        'disposable_email_flag', 'billing_lat', 'billing_long', 'seconds_since_last_txn',
+        'is_new_device', 'geo_distance_from_last_txn', 'suspicious_agent', 'is_business_hours', 
+        'sum_amount_1h', 'avg_amount_1h', 'txn_count_1h', 
+        'sum_amount_24h', 'avg_amount_24h', 'txn_count_24h'
+      ];
+    } else if (modelType === 'topup') {
+      // TopUp model requires float32 input with 27 features (note: spec shows 26 features but indices 0-26 = 27)
+      dataType = 'float32';
+      featureOrder = [
+        'is_weekend', 'is_night', 'txn_type_idx', 'is_ibft', 'is_topup', 'is_qr',
+        'amount_usd', 'amount_log', 'is_high_amount', 
+        'name_is_ascii', 'name_has_digit', 'name_has_symbol', 'name_repeated_char', 
+        'disposable_email_flag', 'billing_lat', 'billing_long', 'seconds_since_last_txn',
+        'is_new_device', 'geo_distance_from_last_txn', 'suspicious_agent', 'is_business_hours', 
+        'sum_amount_1h', 'avg_amount_1h', 'txn_count_1h', 
+        'sum_amount_24h', 'avg_amount_24h', 'txn_count_24h'
+      ];
+    } else {
+      throw new Error(`Unknown model type: ${modelType}`);
+    }
+
+    // Extract features in the correct order
     const featureArray = featureOrder.map(key => {
       const value = features[key];
       return typeof value === 'number' ? value : 0;
     });
 
-    return new Float32Array(featureArray);
+    // Return correct data type based on model requirements
+    if (dataType === 'int64') {
+      return new BigInt64Array(featureArray.map(v => BigInt(Math.round(v))));
+    } else {
+      return new Float32Array(featureArray);
+    }
   }
 
   /**

@@ -5,14 +5,16 @@ const logger = require('../utils/logger');
 const FeatureMapper = require('../utils/featureMapper');
 const alertService = require('./alertService');
 const decisionService = require('./decisionService');
+const PythonONNXService = require('./pythonONNXService');
 
 class FraudDetectionService {
   constructor() {
     this.models = new Map();
     this.isInitialized = false;
+    this.pythonService = new PythonONNXService();
     this.modelPaths = {
-      qr: process.env.QR_MODEL_PATH || './models/qr_model.onnx',
-      ibft: process.env.IBFT_MODEL_PATH || './models/ibft_model.onnx',
+      qr: process.env.QR_XGB_MODEL_PATH || './models/xgb_qr.onnx',
+      ibft: process.env.IBFT_MODEL_PATH || './models/model_ibft.onnx',
       topup: process.env.TOPUP_MODEL_PATH || './models/topup_model.onnx'
     };
     this.thresholds = {
@@ -26,34 +28,55 @@ class FraudDetectionService {
     try {
       logger.info('Initializing fraud detection models...');
 
-      // Check if models directory exists
-      const modelsDir = path.dirname(this.modelPaths.qr);
-      try {
-        await fs.access(modelsDir);
-      } catch (error) {
-        logger.warn(`Models directory ${modelsDir} does not exist. Creating placeholder models.`);
-        await this.createPlaceholderModels(modelsDir);
-      }
-
-      // Load available models
-      for (const [modelType, modelPath] of Object.entries(this.modelPaths)) {
-        try {
-          await fs.access(modelPath);
-          const session = await ort.InferenceSession.create(modelPath);
-          this.models.set(modelType, session);
-          logger.info(`Loaded ${modelType.toUpperCase()} model from ${modelPath}`);
-        } catch (error) {
-          logger.warn(`Failed to load ${modelType.toUpperCase()} model from ${modelPath}: ${error.message}`);
-          // Create a mock model for testing
-          this.models.set(modelType, null);
-        }
-      }
+      // Load XGBoost QR model (main working model) with Node.js ONNX runtime
+      await this.loadSingleModel('qr', this.modelPaths.qr);
+      
+      // For IBFT and TopUp models, use Python ONNX runtime
+      // Mark them as available for Python inference
+      this.models.set('ibft', 'python');
+      this.models.set('topup', 'python');
+      
+      logger.info('IBFT and TopUp models configured for Python ONNX runtime');
 
       this.isInitialized = true;
       logger.info('Fraud detection service initialized successfully');
 
     } catch (error) {
       logger.error('Failed to initialize fraud detection service:', error);
+      throw error;
+    }
+  }
+
+  async loadModelWithTimeout(modelType, modelPath, timeout = 30000) {
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        reject(new Error(`Model loading timeout after ${timeout}ms`));
+      }, timeout);
+
+      this.loadSingleModel(modelType, modelPath)
+        .then(() => {
+          clearTimeout(timeoutId);
+          resolve();
+        })
+        .catch((error) => {
+          clearTimeout(timeoutId);
+          reject(error);
+        });
+    });
+  }
+
+  async loadSingleModel(modelType, modelPath) {
+    try {
+      logger.info(`Loading ${modelType.toUpperCase()} model from ${modelPath}...`);
+      const session = await ort.InferenceSession.create(modelPath);
+      this.models.set(modelType, {
+        model: session,
+        type: 'single'
+      });
+      logger.info(`✓ Loaded ${modelType.toUpperCase()} model successfully`);
+    } catch (error) {
+      logger.error(`✗ Failed to load ${modelType.toUpperCase()} model: ${error.message}`);
+      this.models.set(modelType, null);
       throw error;
     }
   }
@@ -88,6 +111,24 @@ class FraudDetectionService {
       // Map Kafka features to model features
       const features = FeatureMapper.mapKafkaToModelFeatures(transactionData);
       
+      // Fill in missing optional fields with defaults
+      features.amount_log = features.amount_log || Math.log10(features.amount_usd || 1);
+      features.geo_distance_from_last_txn = features.geo_distance_from_last_txn || 0;
+      features.seconds_since_last_txn = features.seconds_since_last_txn || 0;
+      features.sum_amount_1h = features.sum_amount_1h || features.amount_usd || 0;
+      features.avg_amount_1h = features.avg_amount_1h || features.amount_usd || 0;
+      features.txn_count_1h = features.txn_count_1h || 1;
+      features.sum_amount_24h = features.sum_amount_24h || features.amount_usd || 0;
+      features.avg_amount_24h = features.avg_amount_24h || features.amount_usd || 0;
+      features.txn_count_24h = features.txn_count_24h || 1;
+      features.velocity_1h = features.velocity_1h || 1;
+      features.rank_amount_per_day = features.rank_amount_per_day || 1;
+      features.same_device_txn_1h = features.same_device_txn_1h || 1;
+      features.lat_shift = features.lat_shift || 0;
+      features.lng_shift = features.lng_shift || 0;
+      features.geo_speed_km_per_min = features.geo_speed_km_per_min || 0;
+      features.change_in_user_agent = features.change_in_user_agent || 0;
+      
       // Validate features
       const validation = FeatureMapper.validateFeatures(features);
       if (!validation.isValid) {
@@ -106,10 +147,17 @@ class FraudDetectionService {
         isFraud: prediction.fraudScore > this.thresholds[txnType],
         threshold: this.thresholds[txnType],
         confidence: prediction.confidence,
+        modelVersion: prediction.modelVersion,
+        riskLevel: this.classifyRisk(prediction.fraudScore, txnType),
         processedFeatures: features,
         processingTimeMs: Date.now() - startTime,
         timestamp: new Date().toISOString()
       };
+
+      // Add model-specific information
+      if (prediction.components) {
+        result.components = prediction.components;
+      }
 
       // Send alerts if fraud detected
       if (result.isFraud) {
@@ -133,35 +181,146 @@ class FraudDetectionService {
 
   async predict(features, modelType) {
     try {
-      const model = this.models.get(modelType);
+      const modelConfig = this.models.get(modelType);
       
-      if (!model) {
+      if (!modelConfig) {
         // Mock prediction when model is not available
         logger.warn(`Using mock prediction for ${modelType} model`);
         return this.mockPrediction(features, modelType);
       }
 
-      // Prepare input for ONNX model
-      const inputArray = FeatureMapper.prepareONNXInput(features, modelType);
-      const inputTensor = new ort.Tensor('float32', inputArray, [1, inputArray.length]);
+      if (modelType === 'qr') {
+        return await this.predictQR(features, modelConfig);
+      } else if (modelType === 'ibft') {
+        return await this.predictIBFT(features, modelConfig);
+      } else if (modelType === 'topup') {
+        return await this.predictTopup(features, modelConfig);
+      }
 
-      // Run inference
-      const feeds = { [model.inputNames[0]]: inputTensor };
-      const output = await model.run(feeds);
-      
-      // Extract prediction (assuming binary classification with probability output)
-      const outputTensor = output[model.outputNames[0]];
-      const fraudScore = outputTensor.data[1] || outputTensor.data[0]; // Probability of fraud class
-      
-      return {
-        fraudScore: Math.min(Math.max(fraudScore, 0), 1), // Clamp between 0 and 1
-        confidence: Math.abs(fraudScore - 0.5) * 2 // Distance from 0.5, scaled to 0-1
-      };
+      throw new Error(`Unsupported model type: ${modelType}`);
 
     } catch (error) {
       logger.error(`Error in ${modelType} model prediction:`, error);
       // Fall back to mock prediction
       return this.mockPrediction(features, modelType);
+    }
+  }
+
+  async predictQR(features, modelConfig) {
+    try {
+      // Use XGBoost model with 34 features for QR prediction
+      const input = FeatureMapper.prepareONNXInput(features, 'qr', 'xgb');
+      const tensor = new ort.Tensor('int64', input, [1, input.length]);
+      
+      // Handle both direct session and modelConfig structure
+      const session = modelConfig.model || modelConfig;
+      
+      const feeds = { [session.inputNames[0]]: tensor };
+      const output = await session.run(feeds);
+      
+      // Extract fraud probability from output
+      let fraudScore = 0;
+      
+      // Try to get probabilities output first (usually at index 1 for fraud class)
+      if (output.probabilities && output.probabilities.data) {
+        const probData = output.probabilities.data;
+        fraudScore = probData.length > 1 ? probData[1] : probData[0];
+      } else if (output.label && output.label.data) {
+        // Fallback to label if probabilities not available
+        fraudScore = output.label.data[0];
+      } else {
+        // Try first output if named outputs don't work
+        const outputData = output[session.outputNames[0]].data;
+        fraudScore = outputData.length > 1 ? outputData[1] : outputData[0];
+      }
+      
+      // Ensure score is in [0,1] range
+      fraudScore = Math.min(Math.max(fraudScore, 0), 1);
+      
+      logger.info(`QR XGBoost prediction successful: ${fraudScore}`);
+      
+      return {
+        fraudScore: fraudScore,
+        confidence: 0.90,
+        modelVersion: 'qr_xgb_v1',
+        details: {
+          xgb_score: fraudScore,
+          model_type: 'xgboost',
+          feature_count: input.length
+        }
+      };
+      
+    } catch (error) {
+      logger.error('Error in QR XGBoost prediction:', error);
+      return this.mockPrediction(features, 'qr');
+    }
+  }
+
+  async predictIBFT(features, modelConfig) {
+    try {
+      // Use Python ONNX service for IBFT model
+      const inputArray = FeatureMapper.prepareONNXInput(features, 'ibft');
+      const inputFeatures = Array.from(inputArray);
+      
+      const result = await this.pythonService.runInference('ibft', inputFeatures);
+      
+      if (!result.success) {
+        throw new Error(result.error);
+      }
+
+      // Extract fraud probability from Python result
+      let fraudScore = 0;
+      if (result.predictions && result.predictions.length > 1) {
+        const probabilities = result.predictions[1];
+        if (Array.isArray(probabilities) && probabilities.length > 1) {
+          fraudScore = probabilities[1]; // Index 1 is fraud probability
+        } else if (typeof probabilities === 'object' && probabilities['1']) {
+          fraudScore = probabilities['1']; // Key '1' is fraud probability
+        }
+      }
+
+      return {
+        fraudScore: Math.min(Math.max(fraudScore, 0), 1),
+        confidence: Math.abs(fraudScore - 0.5) * 2,
+        modelVersion: 'ibft_model_v1_python'
+      };
+    } catch (error) {
+      logger.error('Error in IBFT model prediction:', error);
+      return this.mockPrediction(features, 'ibft');
+    }
+  }
+
+  async predictTopup(features, modelConfig) {
+    try {
+      // Use Python ONNX service for TopUp model
+      const inputArray = FeatureMapper.prepareONNXInput(features, 'topup');
+      const inputFeatures = Array.from(inputArray);
+      
+      const result = await this.pythonService.runInference('topup', inputFeatures);
+      
+      if (!result.success) {
+        throw new Error(result.error);
+      }
+
+      // Extract fraud probability from Python result
+      let fraudScore = 0;
+      if (result.predictions && result.predictions.length > 1) {
+        const probabilities = result.predictions[1];
+        if (Array.isArray(probabilities) && probabilities.length > 1) {
+          fraudScore = probabilities[1]; // Index 1 is fraud probability
+        } else if (typeof probabilities === 'object' && probabilities['1']) {
+          fraudScore = probabilities['1']; // Key '1' is fraud probability
+        }
+      }
+
+      return {
+        fraudScore: Math.min(Math.max(fraudScore, 0), 1),
+        confidence: Math.abs(fraudScore - 0.5) * 2,
+        modelVersion: 'topup_model_v1_python'
+      };
+    } catch (error) {
+      logger.error('Error in TopUp model prediction:', error);
+      return this.mockPrediction(features, 'topup');
     }
   }
 
@@ -222,13 +381,32 @@ class FraudDetectionService {
     return await this.detectFraud(transactionData);
   }
 
+  classifyRisk(score, modelType) {
+    // Risk classification matching Python inference APIs
+    if (modelType === 'qr') {
+      if (score >= 0.85) return 'high';
+      if (score >= this.thresholds.qr) return 'medium';
+      return 'low';
+    } else if (modelType === 'ibft') {
+      if (score >= 0.9) return 'high';
+      if (score >= this.thresholds.ibft) return 'medium';
+      return 'low';
+    } else if (modelType === 'topup') {
+      if (score >= 0.85) return 'high';
+      if (score >= this.thresholds.topup) return 'medium';
+      return 'low';
+    }
+    return 'unknown';
+  }
+
   getModelStatus() {
     const status = {};
     for (const [modelType, model] of this.models.entries()) {
       status[modelType] = {
         loaded: model !== null,
         threshold: this.thresholds[modelType],
-        path: this.modelPaths[modelType]
+        paths: this.modelPaths[modelType],
+        type: model?.type || 'unknown'
       };
     }
     
