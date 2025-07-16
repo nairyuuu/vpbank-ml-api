@@ -1,10 +1,49 @@
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
 
 class PythonONNXService {
   constructor() {
-    this.pythonPath = path.join(__dirname, '..', '..', '.venv', 'Scripts', 'python.exe');
+    // Cross-platform Python path detection with fallbacks
+    this.pythonPath = this.detectPythonPath();
     this.scriptPath = path.join(__dirname, 'python_model_runner.py');
+  }
+
+  detectPythonPath() {
+    const candidates = [];
+    
+    if (os.platform() === 'win32') {
+      // Windows candidates
+      candidates.push(
+        path.join(__dirname, '..', '..', '.venv', 'Scripts', 'python.exe'),
+        'python',
+        'python3'
+      );
+    } else {
+      // Linux/macOS/WSL candidates
+      candidates.push(
+        path.join(__dirname, '..', '..', '.venv', 'bin', 'python'),
+        'python3',
+        'python'
+      );
+    }
+    
+    // Check each candidate
+    for (const candidate of candidates) {
+      if (path.isAbsolute(candidate)) {
+        // Check if absolute path exists
+        if (fs.existsSync(candidate)) {
+          return candidate;
+        }
+      } else {
+        // For system python, just return the command (will be resolved by spawn)
+        return candidate;
+      }
+    }
+    
+    // Default fallback
+    return os.platform() === 'win32' ? 'python' : 'python3';
   }
 
   /**
